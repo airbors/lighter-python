@@ -149,7 +149,7 @@ class WsClient:
             self.on_account_update(account_id, self.account_states[account_id])
 
     def handle_unhandled_message(self, message):
-        raise Exception(f"Unhandled message: {message}")
+        pass  # Ignore unknown message types (future-proofs against new server messages)
 
     def on_error(self, ws, error):
         raise Exception(f"Error: {error}")
