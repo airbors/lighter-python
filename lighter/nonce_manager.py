@@ -10,6 +10,19 @@ from lighter.api_client import ApiClient
 from lighter.errors import ValidationError
 
 
+INT64_MAX = (1 << 63) - 1
+
+
+def _validated_next_nonce_response(resp) -> int:
+    code = getattr(resp, "code", None)
+    nonce = getattr(resp, "nonce", None)
+    if type(code) is not int or code != 200:
+        raise ValidationError("next nonce response must have exact code 200")
+    if type(nonce) is not int or not 0 <= nonce <= INT64_MAX:
+        raise ValidationError("next nonce must be an exact signed-int64 integer")
+    return nonce
+
+
 def get_nonce_from_api(client: ApiClient, account_index: int, api_key: int) -> int:
     # Blocking fallback for callers using the sync next_nonce()/refresh paths.
     # The async paths never use this; they go through TransactionApi.
@@ -67,7 +80,42 @@ class NonceManager(abc.ABC):
         resp = await TransactionApi(self.api_client).next_nonce(
             account_index=self.account_index, api_key_index=api_key
         )
-        return resp.nonce
+        return _validated_next_nonce_response(resp)
+
+    async def fetch_next_nonce(self, api_key: int) -> int:
+        """Fetch exchange authority without mutating the local nonce cache."""
+
+        self._validate_key(api_key)
+        return await self._fetch_nonce(api_key)
+
+    def install_fetched_next_nonce(self, api_key: int, next_nonce: int) -> None:
+        """Install a fetched next nonce for owner-serialized local allocation."""
+
+        self._validate_key(api_key)
+        if type(next_nonce) is not int or not 0 <= next_nonce <= INT64_MAX:
+            raise ValidationError("next nonce must be an exact signed-int64 integer")
+        self.nonce[api_key] = next_nonce - 1
+
+    def allocate_cached_nonce(self, api_key: int) -> Tuple[int, int]:
+        """Allocate from installed authority without performing network I/O."""
+
+        self._validate_key(api_key)
+        if api_key not in self.nonce:
+            raise ValidationError("nonce authority is not installed")
+        if self.nonce[api_key] >= INT64_MAX:
+            raise ValidationError("nonce space is exhausted")
+        self.nonce[api_key] += 1
+        return api_key, self.nonce[api_key]
+
+    def rollback_cached_nonce(self, api_key: int, expected_nonce: int) -> None:
+        """Roll back only an exact, still-current cached tail allocation."""
+
+        self._validate_key(api_key)
+        if type(expected_nonce) is not int or not 0 <= expected_nonce <= INT64_MAX:
+            raise ValidationError("expected nonce must be an exact signed-int64 integer")
+        if self.nonce.get(api_key) != expected_nonce:
+            raise ValidationError("nonce allocation is no longer the cached tail")
+        self.nonce[api_key] -= 1
 
     def _ensure_nonce_sync(self, api_key: int) -> None:
         if api_key not in self.nonce:
@@ -90,6 +138,16 @@ class NonceManager(abc.ABC):
 
     async def async_hard_refresh_nonce(self, api_key: int):
         self.nonce[api_key] = await self._fetch_nonce(api_key) - 1
+
+    def invalidate_nonce(self, api_key: int) -> None:
+        """Discard cached authority for one key without allocating a nonce.
+
+        The next ordinary allocation becomes cold and fetches current exchange
+        authority.  Callers must still serialize this with allocations for the
+        same key; the manager remains the sole owner of its cache.
+        """
+        self._validate_key(api_key)
+        self.nonce.pop(api_key, None)
 
     @abc.abstractmethod
     def next_nonce(self, api_key: Optional[int] = None) -> Tuple[int, int]:

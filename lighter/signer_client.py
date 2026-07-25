@@ -366,8 +366,15 @@ class SignerClient:
             api_client=self.api_client,
             api_keys_list=list(api_private_keys.keys()),
         )
-        for api_key_index in api_private_keys.keys():
-            self.create_client(api_key_index)
+        try:
+            for api_key_index in api_private_keys.keys():
+                self.create_client(api_key_index)
+        except BaseException as exc:
+            # Construction is synchronous while ApiClient cleanup is async.
+            # Preserve the exact partially-acquired resource on the exception
+            # so an async composition owner can close it before propagating.
+            setattr(exc, "lighter_partial_api_client", self.api_client)
+            raise
 
     # === signer helpers ===
     @staticmethod
