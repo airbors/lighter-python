@@ -12,11 +12,15 @@
 """  # noqa: E501
 
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import io
 import json
+import os
 import re
 import ssl
-from typing import Optional, Union
+from typing import Callable, Mapping, Optional, Union
+from weakref import WeakKeyDictionary
 
 import aiohttp
 import aiohttp_retry
@@ -26,6 +30,21 @@ from lighter.exceptions import ApiException, ApiValueError
 RESTResponseType = aiohttp.ClientResponse
 
 ALLOW_RETRY_METHODS = frozenset({'DELETE', 'GET', 'HEAD', 'OPTIONS', 'PUT', 'TRACE'})
+LATENCY_TRACE_DIR_ENV = 'BTCFINE_LATENCY_TRACE_DIR'
+RequestTraceObserver = Callable[[str, Mapping[str, object]], None]
+_request_trace_observer: ContextVar[Optional[RequestTraceObserver]] = ContextVar(
+    'lighter_request_trace_observer', default=None
+)
+_response_traces = WeakKeyDictionary()
+
+
+def _notify_trace(observer, phase, fields=None):
+    if observer is None:
+        return
+    try:
+        observer(phase, {} if fields is None else fields)
+    except Exception:
+        return
 
 class RESTResponse(io.IOBase):
 
@@ -34,10 +53,31 @@ class RESTResponse(io.IOBase):
         self.status = resp.status
         self.reason = resp.reason
         self.data = None
+        trace = _response_traces.pop(resp, None)
+        self._trace_observer = None if trace is None else trace[0]
+        self._connection_state = 'unknown' if trace is None else trace[1]
 
     async def read(self):
         if self.data is None:
-            self.data = await self.response.read()
+            try:
+                self.data = await self.response.read()
+            except Exception:
+                _notify_trace(
+                    self._trace_observer,
+                    'response_body_error',
+                    {'connection_state': self._connection_state},
+                )
+                self._trace_observer = None
+                raise
+            _notify_trace(
+                self._trace_observer,
+                'response_body_end',
+                {
+                    'connection_state': self._connection_state,
+                    'response_bytes': len(self.data),
+                },
+            )
+            self._trace_observer = None
         return self.data
 
     def getheaders(self):
@@ -76,10 +116,26 @@ class RESTClientObject:
         self.proxy = configuration.proxy
         self.proxy_headers = configuration.proxy_headers
 
+        trace_configs = []
+        raw_trace_dir = os.environ.get(LATENCY_TRACE_DIR_ENV)
+        if raw_trace_dir is not None and raw_trace_dir.strip():
+            trace_config = aiohttp.TraceConfig()
+            trace_config.on_request_start.append(self._trace_request_start)
+            trace_config.on_connection_create_start.append(
+                self._trace_connection_create_start
+            )
+            trace_config.on_connection_reuseconn.append(
+                self._trace_connection_reuse
+            )
+            trace_config.on_request_end.append(self._trace_request_end)
+            trace_config.on_request_exception.append(self._trace_request_exception)
+            trace_configs.append(trace_config)
+
         # https pool manager
         self.pool_manager = aiohttp.ClientSession(
             connector=connector,
-            trust_env=True
+            trust_env=True,
+            trace_configs=trace_configs,
         )
 
         retries = configuration.retries
@@ -96,6 +152,64 @@ class RESTClientObject:
             )
         else:
             self.retry_client = None
+
+    @contextmanager
+    def trace_request(self, observer):
+        """Attach one task-local, best-effort observer to this HTTP request."""
+
+        if observer is not None and not callable(observer):
+            raise TypeError('request trace observer must be callable')
+        token = _request_trace_observer.set(observer)
+        try:
+            yield
+        finally:
+            _request_trace_observer.reset(token)
+
+    @staticmethod
+    async def _trace_request_start(session, trace_config_ctx, params):
+        observer = _request_trace_observer.get()
+        trace_config_ctx.btcfine_observer = observer
+        trace_config_ctx.btcfine_connection_state = 'unknown'
+        _notify_trace(observer, 'request_start')
+
+    @staticmethod
+    async def _trace_connection_create_start(session, trace_config_ctx, params):
+        trace_config_ctx.btcfine_connection_state = 'new'
+
+    @staticmethod
+    async def _trace_connection_reuse(session, trace_config_ctx, params):
+        trace_config_ctx.btcfine_connection_state = 'reused'
+
+    @staticmethod
+    async def _trace_request_end(session, trace_config_ctx, params):
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        connection_state = getattr(
+            trace_config_ctx, 'btcfine_connection_state', 'unknown'
+        )
+        _response_traces[params.response] = (observer, connection_state)
+        _notify_trace(
+            observer,
+            'response_headers',
+            {
+                'connection_state': connection_state,
+                'http_status': params.response.status,
+            },
+        )
+
+    @staticmethod
+    async def _trace_request_exception(session, trace_config_ctx, params):
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        connection_state = getattr(
+            trace_config_ctx, 'btcfine_connection_state', 'unknown'
+        )
+        _notify_trace(
+            observer,
+            'request_error',
+            {
+                'connection_state': connection_state,
+                'error_type': type(params.exception).__name__,
+            },
+        )
 
     async def close(self):
         await self.pool_manager.close()
