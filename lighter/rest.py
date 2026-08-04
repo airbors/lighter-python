@@ -14,6 +14,7 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import ipaddress
 import io
 import json
 import os
@@ -31,11 +32,13 @@ RESTResponseType = aiohttp.ClientResponse
 
 ALLOW_RETRY_METHODS = frozenset({'DELETE', 'GET', 'HEAD', 'OPTIONS', 'PUT', 'TRACE'})
 LATENCY_TRACE_DIR_ENV = 'BTCFINE_LATENCY_TRACE_DIR'
+TRANSPORT_TRACE_VERSION = 1
 RequestTraceObserver = Callable[[str, Mapping[str, object]], None]
 _request_trace_observer: ContextVar[Optional[RequestTraceObserver]] = ContextVar(
     'lighter_request_trace_observer', default=None
 )
 _response_traces = WeakKeyDictionary()
+_TRACE_MISSING = object()
 
 
 def _notify_trace(observer, phase, fields=None):
@@ -45,6 +48,97 @@ def _notify_trace(observer, phase, fields=None):
         observer(phase, {} if fields is None else fields)
     except Exception:
         return
+
+
+def _trace_attribute(owner, *names):
+    if owner is None:
+        return _TRACE_MISSING
+    for name in names:
+        try:
+            value = getattr(owner, name)
+        except Exception:
+            continue
+        return value
+    return _TRACE_MISSING
+
+
+def _connector_trace_fields(session):
+    connector = _trace_attribute(session, 'connector')
+    if connector is _TRACE_MISSING or connector is None:
+        return {}
+
+    values = {
+        'keepalive_timeout': _trace_attribute(
+            connector, 'keepalive_timeout', '_keepalive_timeout'
+        ),
+        'dns_cache_enabled': _trace_attribute(
+            connector, 'use_dns_cache', '_use_dns_cache'
+        ),
+        'connection_limit': _trace_attribute(connector, 'limit', '_limit'),
+        'connection_limit_per_host': _trace_attribute(
+            connector, 'limit_per_host', '_limit_per_host'
+        ),
+        'force_close': _trace_attribute(connector, 'force_close', '_force_close'),
+    }
+    cached_hosts = _trace_attribute(connector, '_cached_hosts')
+    values['dns_cache_ttl'] = _trace_attribute(
+        connector, 'ttl_dns_cache', '_ttl_dns_cache'
+    )
+    if values['dns_cache_ttl'] is _TRACE_MISSING:
+        values['dns_cache_ttl'] = _trace_attribute(cached_hosts, 'ttl', '_ttl')
+
+    return {
+        name: value
+        for name, value in values.items()
+        if value is None or isinstance(value, (bool, int, float, str))
+    }
+
+
+def _request_scheme(params):
+    url = _trace_attribute(params, 'url')
+    scheme = _trace_attribute(url, 'scheme')
+    if isinstance(scheme, str):
+        return scheme.lower()
+    return ''
+
+
+def _request_dns_resolution_expected(params):
+    """Return whether aiohttp should traverse its DNS path without exposing host."""
+
+    url = _trace_attribute(params, 'url')
+    host = _trace_attribute(url, 'raw_host', 'host')
+    if not isinstance(host, str) or not host:
+        return True
+    try:
+        ipaddress.ip_address(host.strip('[]'))
+    except ValueError:
+        return True
+    return False
+
+
+def _connection_trace_fields(trace_config_ctx):
+    state = _trace_attribute(trace_config_ctx, 'btcfine_connection_state')
+    if not isinstance(state, str):
+        state = 'unknown'
+    scheme = _trace_attribute(trace_config_ctx, 'btcfine_request_scheme')
+    if not isinstance(scheme, str):
+        scheme = ''
+    return {
+        'connection_state': state,
+        'scheme': scheme,
+    }
+
+
+def _connection_create_trace_fields(trace_config_ctx, *, completed):
+    fields = _connection_trace_fields(trace_config_ctx)
+    if fields['scheme'] == 'https':
+        fields['connection_scope'] = 'dns_tcp_tls_combined'
+        if completed:
+            fields['tls_separately_observable'] = False
+    else:
+        fields['connection_scope'] = 'dns_tcp_combined'
+    return fields
+
 
 class RESTResponse(io.IOBase):
 
@@ -61,11 +155,14 @@ class RESTResponse(io.IOBase):
         if self.data is None:
             try:
                 self.data = await self.response.read()
-            except Exception:
+            except Exception as exc:
                 _notify_trace(
                     self._trace_observer,
                     'response_body_error',
-                    {'connection_state': self._connection_state},
+                    {
+                        'connection_state': self._connection_state,
+                        'error_type': type(exc).__name__,
+                    },
                 )
                 self._trace_observer = None
                 raise
@@ -121,8 +218,25 @@ class RESTClientObject:
         if raw_trace_dir is not None and raw_trace_dir.strip():
             trace_config = aiohttp.TraceConfig()
             trace_config.on_request_start.append(self._trace_request_start)
+            trace_config.on_connection_queued_start.append(
+                self._trace_connection_queued_start
+            )
+            trace_config.on_connection_queued_end.append(
+                self._trace_connection_queued_end
+            )
+            trace_config.on_dns_resolvehost_start.append(
+                self._trace_dns_resolve_start
+            )
+            trace_config.on_dns_resolvehost_end.append(
+                self._trace_dns_resolve_end
+            )
+            trace_config.on_dns_cache_hit.append(self._trace_dns_cache_hit)
+            trace_config.on_dns_cache_miss.append(self._trace_dns_cache_miss)
             trace_config.on_connection_create_start.append(
                 self._trace_connection_create_start
+            )
+            trace_config.on_connection_create_end.append(
+                self._trace_connection_create_end
             )
             trace_config.on_connection_reuseconn.append(
                 self._trace_connection_reuse
@@ -170,15 +284,103 @@ class RESTClientObject:
         observer = _request_trace_observer.get()
         trace_config_ctx.btcfine_observer = observer
         trace_config_ctx.btcfine_connection_state = 'unknown'
-        _notify_trace(observer, 'request_start')
+        trace_config_ctx.btcfine_request_scheme = _request_scheme(params)
+        trace_config_ctx.btcfine_dns_resolution_expected = (
+            _request_dns_resolution_expected(params)
+        )
+        fields = {
+            'transport_trace_version': TRANSPORT_TRACE_VERSION,
+            'scheme': trace_config_ctx.btcfine_request_scheme,
+            'connection_state': 'unknown',
+            'dns_resolution_expected': (
+                trace_config_ctx.btcfine_dns_resolution_expected
+            ),
+        }
+        fields.update(_connector_trace_fields(session))
+        _notify_trace(observer, 'request_start', fields)
+
+    @staticmethod
+    async def _trace_connection_queued_start(session, trace_config_ctx, params):
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        _notify_trace(
+            observer,
+            'connection_queued_start',
+            _connection_trace_fields(trace_config_ctx),
+        )
+
+    @staticmethod
+    async def _trace_connection_queued_end(session, trace_config_ctx, params):
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        _notify_trace(
+            observer,
+            'connection_queued_end',
+            _connection_trace_fields(trace_config_ctx),
+        )
+
+    @staticmethod
+    async def _trace_dns_resolve_start(session, trace_config_ctx, params):
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        _notify_trace(
+            observer,
+            'dns_resolve_start',
+            _connection_trace_fields(trace_config_ctx),
+        )
+
+    @staticmethod
+    async def _trace_dns_resolve_end(session, trace_config_ctx, params):
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        _notify_trace(
+            observer,
+            'dns_resolve_end',
+            _connection_trace_fields(trace_config_ctx),
+        )
+
+    @staticmethod
+    async def _trace_dns_cache_hit(session, trace_config_ctx, params):
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        _notify_trace(
+            observer,
+            'dns_cache_hit',
+            _connection_trace_fields(trace_config_ctx),
+        )
+
+    @staticmethod
+    async def _trace_dns_cache_miss(session, trace_config_ctx, params):
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        _notify_trace(
+            observer,
+            'dns_cache_miss',
+            _connection_trace_fields(trace_config_ctx),
+        )
 
     @staticmethod
     async def _trace_connection_create_start(session, trace_config_ctx, params):
         trace_config_ctx.btcfine_connection_state = 'new'
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        _notify_trace(
+            observer,
+            'connection_create_start',
+            _connection_create_trace_fields(trace_config_ctx, completed=False),
+        )
+
+    @staticmethod
+    async def _trace_connection_create_end(session, trace_config_ctx, params):
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        _notify_trace(
+            observer,
+            'connection_create_end',
+            _connection_create_trace_fields(trace_config_ctx, completed=True),
+        )
 
     @staticmethod
     async def _trace_connection_reuse(session, trace_config_ctx, params):
         trace_config_ctx.btcfine_connection_state = 'reused'
+        observer = getattr(trace_config_ctx, 'btcfine_observer', None)
+        _notify_trace(
+            observer,
+            'connection_reuse',
+            _connection_trace_fields(trace_config_ctx),
+        )
 
     @staticmethod
     async def _trace_request_end(session, trace_config_ctx, params):
