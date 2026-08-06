@@ -32,6 +32,7 @@ from lighter.models.trades import Trades
 
 from lighter.api_client import ApiClient, RequestSerialized
 from lighter.api_response import ApiResponse
+from lighter.exceptions import ApiException
 from lighter.rest import RESTResponseType
 
 
@@ -2548,6 +2549,60 @@ class OrderApi:
             response_data=response_data,
             response_types_map=_response_types_map,
         ).data
+
+
+    @validate_call
+    async def btcfine_order_book_orders_raw(
+        self,
+        market_id: StrictInt,
+        limit: Annotated[int, Field(le=250, strict=True, ge=1)],
+        _request_timeout: Union[
+            None,
+            Annotated[StrictFloat, Field(gt=0)],
+            Tuple[
+                Annotated[StrictFloat, Field(gt=0)],
+                Annotated[StrictFloat, Field(gt=0)]
+            ]
+        ] = None,
+    ) -> bytes:
+        """Return one fully-read raw order-book response for btcfine."""
+
+        _param = self._order_book_orders_serialize(
+            market_id=market_id,
+            limit=limit,
+            _request_auth=None,
+            _content_type=None,
+            _headers=None,
+            _host_index=0,
+        )
+
+        response_data = await self.api_client.call_api(
+            *_param,
+            _request_timeout=_request_timeout
+        )
+        await response_data.read()
+        if response_data.status != 200:
+            if not 200 <= response_data.status <= 299:
+                self.api_client.response_deserialize(
+                    response_data=response_data,
+                    response_types_map={
+                        '200': "OrderBookOrders",
+                        '400': "ResultCode",
+                    },
+                )
+            raise ApiException(
+                http_resp=response_data,
+                reason=(
+                    "Unexpected success status for btcfine raw "
+                    "order-book response"
+                ),
+            )
+        if type(response_data.data) is not bytes:
+            raise ApiException(
+                status=0,
+                reason="btcfine raw order-book response must be exact bytes",
+            )
+        return response_data.data
 
 
     async def order_book_orders_with_http_info(

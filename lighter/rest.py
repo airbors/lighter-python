@@ -207,7 +207,9 @@ class RESTClientObject:
 
         connector = aiohttp.TCPConnector(
             limit=maxsize,
-            ssl=ssl_context
+            ssl=ssl_context,
+            keepalive_timeout=45.0,
+            ttl_dns_cache=45,
         )
 
         self.proxy = configuration.proxy
